@@ -57,22 +57,22 @@ def process_pptx_advanced(input_file):
                     
                 # 3. Perform Inpainting (Remove text, keep background images)
                 # This makes the "image" part clean so text isn't "baked in"
-                cleaned_img_np = cv2.inpaint(img_np, mask, 3, cv2.INPAINT_TELEA)
+                    cleaned_img_np = cv2.inpaint(img_np, mask, 3, cv2.INPAINT_TELEA)
 
                 # 4. Save the "cleaned" image (images/graphics) back to the slide
-                cleaned_pil = Image.fromarray(cleaned_img_np)
-                img_byte_arr = io.BytesIO()
-                cleaned_pil.save(img_byte_arr, format='PNG')
+                    cleaned_pil = Image.fromarray(cleaned_img_np)
+                    img_byte_arr = io.BytesIO()
+                    cleaned_pil.save(img_byte_arr, format='PNG')
                
                 # Place the background image first
-                new_slide.shapes.add_picture(img_byte_arr, 0, 0, Pt(slide_width_pts), Pt(slide_height_pts))
+                    new_slide.shapes.add_picture(img_byte_arr, 0, 0, Pt(slide_width_pts), Pt(slide_height_pts))
 
                 # 5. Place Editable Text Boxes on top
-                for block in extracted_text_blocks:
-                    bbox = block['bbox']
-                    x_px, y_px = bbox[0][0], bbox[0][1]
-                    w_px = bbox[1][0] - bbox[0][0]
-                    h_px = bbox[2][1] - bbox[1][1]
+                    for block in extracted_text_blocks:
+                        bbox = np.block['bbox']
+                        x_px, y_px = bbox[0][0], bbox[0][1]
+                        w_px = bbox[1][0] - bbox[0][0]
+                        h_px = bbox[2][1] - bbox[1][1]
 
                     left = (x_px / img_w) * slide_width_pts
                     top = (y_px / img_h) * slide_height_pts
