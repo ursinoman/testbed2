@@ -8,87 +8,94 @@ from PIL import Image
 import io
 import os
 
-# 1. Initialize the OCR Reader (English)
+# Initialize OCR
 @st.cache_resource
 def load_ocr():
     return easyocr.Reader(['en'])
 
 reader = load_ocr()
 
-def process_pptx(input_file):
+def process_pptx_advanced(input_file):
     prs = Presentation(input_file)
     output_prs = Presentation()
  
-    # Get slide dimensions for coordinate mapping
+    # Standard PPTX Slide Dimensions (960 x 540 in Points)
     slide_width_pts = output_prs.slide_width.pt
     slide_height_pts = output_prs.slide_height.pt
 
-    st.info(f"Processing {len(prs.slides)} slides...")
-
-    for i, slide in enumerate(prs.slides):
-        new_slide = output_prs.slides.add_slide(output_prs.slide_layouts[6]) # Blank layout
+    for slide in prs.slides:
+        new_slide = output_prs.slides.add_slide(output_prs.slide_layouts[6])
         
         for shape in slide.shapes:
-            if shape.shape_type == 13:  # 13 is a Picture
-                # Convert PPTX image to OpenCV format
-                image_stream = io.BytesIO(shape.image.blob)
-                img = Image.open(image_stream).convert('RGB')
-                img_np = np.array(img)
+            if shape.shape_type == 13:  # Picture
+               image_stream = io.BytesIO(shape.image.blob)
+               img_pil = Image.open(image_stream).convert('RGB')
+               img_np = np.array(img_pil)
+               img_h, img_w, _ = img_np.shape
                 
-                # Perform OCR
-                results = reader.readtext(img_np)
+               # 1. OCR to find Text Bounding Boxes
+               results = reader.readtext(img_np)
                 
-                # Get Image dimensions in pixels
-                img_h, img_w, _ = img_np.shape
+               # 2. Create a Mask for Inpainting (to remove text from image)
+               mask = np.zeros((img_h, img_w), dtype=np.uint8)
 
-                for (bbox, text, prob) in results:
-                    if prob < 0.2: continue # Skip low confidence
+               # List to store text data for later placement
+               extracted_text_blocks = []
                     
-                    # Calculate relative position within the image
-                    # bbox is: [[x_topleft, y_topleft], [x_tr, y_tr], [x_br, y_br], [x_bl, y_bl]]
+               for (bbox, text, prob) in results:
+                    if prob < 0.2: continue
+
+                    # Convert bbox to integer coordinates
+                    points = np.array(bbox).astype(int)
+                    cv2.fillPoly(mask, [points], 255)
+
+                    extracted_text_blocks.append({
+                        'text': text,
+                        'bbox': bbox,
+                        'prob': prob
+                    })
+                    
+                # 3. Perform Inpainting (Remove text, keep background images)
+                # This makes the "image" part clean so text isn't "baked in"
+                cleaned_img_np = cv2.inpaint(img_np, mask, 3, cv2.INPAINT_TELEA)
+
+                # 4. Save the "cleaned" image (images/graphics) back to the slide
+                cleaned_pil = Image.fromarray(cleaned_img_np)
+                img_byte_arr = io.BytesIO()
+                cleaned_pil.save(img_byte_arr, format='PNG')
+               
+                # Place the background image first
+                new_slide.shapes.add_picture(img_byte_arr, 0, 0, Pt(slide_width_pts), Pt(slide_height_pts))
+
+                # 5. Place Editable Text Boxes on top
+                for block in extracted_text_blocks:
+                    bbox = block['bbox']
                     x_px, y_px = bbox[0][0], bbox[0][1]
                     w_px = bbox[1][0] - bbox[0][0]
                     h_px = bbox[2][1] - bbox[1][1]
 
-                    # Map image pixels to PPTX points
-                    # (Note: This assumes the image fills the slide; 
-                    # for perfection, we'd scale by the shape's actual size on slide)
                     left = (x_px / img_w) * slide_width_pts
                     top = (y_px / img_h) * slide_height_pts
                     width = (w_px / img_w) * slide_width_pts
                     height = (h_px / img_h) * slide_height_pts
 
-                    # Add text box to the NEW slide
                     txBox = new_slide.shapes.add_textbox(Pt(left), Pt(top), Pt(width), Pt(height))
                     tf = txBox.text_frame
-                    tf.text = text
-                    
-                    # Basic styling
-                    for paragraph in tf.paragraphs:
-                        paragraph.font.size = Pt(14)
+                    tf.word_wrap = True
+                    p = tf.paragraphs[0]
+                    p.text = block['text']
+                    p.font.size = Pt(12)
 
-    # Save to buffer
     output_stream = io.BytesIO()
     output_prs.save(output_stream)
     return output_stream.getvalue()
 
 # --- Streamlit UI ---
-st.title("PPTX Un-Flattener 🛠️")
-st.write("Upload a PPT with flat images to convert them into editable text.")
+st.title("Full PPTX Reconstructor 💎")
+st.write("Converts flat images into editable text + cleaned background graphics.")
 
-uploaded_file = st.file_uploader("Choose a PowerPoint file", type="pptx")
-
-if uploaded_file:
-    if st.button("Convert to Editable"):
-        with st.spinner("Analyzing images... this may take a minute."):
-            try:
-                processed_data = process_pptx(uploaded_file)
-                st.success("Conversion Complete!")
-                st.download_button(
-                    label="Download Editable PPTX",
-                    data=processed_data,
-                    file_name="editable_output.pptx",
-                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                )
-            except Exception as e:
-                st.error(f"An error occurred: {e}")
+file = st.file_uploader("Upload PPTX", type="pptx")
+if file and st.button("Extract Everything"):
+    with st.spinner("Decomposing images..."):
+        result = process_pptx_advanced(file)
+        st.download_button("Download Reconstructed PPTX", result, "fully_editable.pptx")
