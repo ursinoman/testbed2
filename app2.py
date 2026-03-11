@@ -29,9 +29,9 @@ def process_pptx(input_file):
         new_slide = output_prs.slides.add_slide(output_prs.slide_layouts[6]) # Blank layout
         
         for shape in slide.shapes:
-            if snp.shapeshape_type == 13:  # 13 is a Picture
+            if shape.shape_type == 13:  # 13 is a Picture
                 # Convert PPTX image to OpenCV format
-                image_stream = io.BytesIO(snp.shapeimage.blob)
+                image_stream = io.BytesIO(shape.image.blob)
                 img = Image.open(image_stream).convert('RGB')
                 img_np = np.array(img)
                 
