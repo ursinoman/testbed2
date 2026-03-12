@@ -69,7 +69,7 @@ def process_pptx_advanced(input_file):
 
                 # 5. Place Editable Text Boxes on top
                     for block in extracted_text_blocks:
-                        bbox = np.block['bbox']
+                        bbox = np.block('bbox')
                         x_px, y_px = bbox[0][0], bbox[0][1]
                         w_px = bbox[1][0] - bbox[0][0]
                         h_px = bbox[2][1] - bbox[1][1]
