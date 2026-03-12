@@ -70,6 +70,14 @@ def process_pptx_advanced(input_file):
                 # 5. Place Editable Text Boxes on top
                     for block in extracted_text_blocks:
                         bbox = np.block('bbox')
+
+                        # Before the crashing line, add a check:
+                        if bbox is None or len(bbox) == 0:      
+                            # Handle the error, e.g., skip this slide or log a warning
+                            print("No bounding box found, skipping.")
+                            return None # Or however you want to handle empty results
+
+                        # Now it is safe to access
                         x_px, y_px = bbox[0][0], bbox[0][1]
                         w_px = bbox[1][0] - bbox[0][0]
                         h_px = bbox[2][1] - bbox[1][1]
