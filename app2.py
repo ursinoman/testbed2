@@ -72,10 +72,10 @@ def process_pptx_advanced(input_file):
                         bbox = np.block('bbox')
 
                         # Before the crashing line, add a check:
-                        if bbox is None or len(bbox) == 0:      
-                            # Handle the error, e.g., skip this slide or log a warning
+                        if bbox is None or (isinstance(bbox, (list, tuple, dict)) and len(bbox) == 0):      
+                            # Handle the empty/None case, e.g., continue or skip this element
                             print("No bounding box found, skipping.")
-                            return None # Or however you want to handle empty results
+                            continue 
 
                         # Now it is safe to access
                         x_px, y_px = bbox[0][0], bbox[0][1]
