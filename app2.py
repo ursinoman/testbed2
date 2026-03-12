@@ -78,7 +78,12 @@ def process_pptx_advanced(input_file):
                             continue 
 
                         # Now it is safe to access
-                        x_px, y_px = bbox[0][0], bbox[0][1]
+                        if bbox and len(bbox) > 0:
+                             x_px, y_px = bbox[0][0], bbox[0][1]
+                        else:
+                            # Handle the empty case, e.g., skip it or set default coordinates
+                            x_px, y_px = 0, 0
+                            # print("Skipping empty box") # Optional debugging   
                         w_px = bbox[1][0] - bbox[0][0]
                         h_px = bbox[2][1] - bbox[1][1]
 
