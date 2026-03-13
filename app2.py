@@ -24,6 +24,8 @@ MIN_OCR_CONFIDENCE = 0.2
 DEFAULT_FONT_SIZE_PT = 14
 OCR_RENDER_SCALE = 2.0
 DEFAULT_IMAGE_WIDTH_PTS = 720
+MAX_SLIDE_DIMENSION_PTS = 4032
+MAX_OCR_IMAGE_SIDE_PX = 2200
 
 
 def _easyocr_cache_dir() -> str:
@@ -404,6 +406,21 @@ def _clean_image(image_np: np.ndarray, mask: np.ndarray) -> bytes:
     return img_bytes.getvalue()
 
 
+def _resize_image_for_ocr(image_np: np.ndarray, max_side_px=MAX_OCR_IMAGE_SIDE_PX):
+    img_h, img_w = image_np.shape[:2]
+    longest_side = max(img_h, img_w)
+    if longest_side <= max_side_px:
+        return image_np
+
+    scale = max_side_px / longest_side
+    resized = cv2.resize(
+        image_np,
+        (max(int(img_w * scale), 1), max(int(img_h * scale), 1)),
+        interpolation=cv2.INTER_AREA,
+    )
+    return resized
+
+
 def _add_text_boxes(new_slide, blocks, img_w, img_h, shape):
     shape_left, shape_top, shape_width, shape_height = _shape_bounds_to_points(shape)
 
@@ -455,12 +472,25 @@ def _full_slide_shape(output_prs):
 
 def _fit_image_to_slide(image_width_px, image_height_px, target_width_pts=DEFAULT_IMAGE_WIDTH_PTS):
     height_pts = target_width_pts * (image_height_px / max(image_width_px, 1))
-    return target_width_pts, max(height_pts, 1)
+    width_pts = target_width_pts
+
+    if height_pts > MAX_SLIDE_DIMENSION_PTS:
+        scale = MAX_SLIDE_DIMENSION_PTS / height_pts
+        width_pts *= scale
+        height_pts = MAX_SLIDE_DIMENSION_PTS
+
+    if width_pts > MAX_SLIDE_DIMENSION_PTS:
+        scale = MAX_SLIDE_DIMENSION_PTS / width_pts
+        width_pts = MAX_SLIDE_DIMENSION_PTS
+        height_pts *= scale
+
+    return max(width_pts, 1), max(height_pts, 1)
 
 
 def _process_flat_image(image_np, output_prs, report, report_key_prefix):
     reader = load_ocr()
     new_slide = output_prs.slides.add_slide(output_prs.slide_layouts[6])
+    image_np = _resize_image_for_ocr(image_np)
     img_h, img_w = image_np.shape[:2]
     blocks, mask = _extract_text_blocks(reader, image_np)
     grouped_blocks = _group_ocr_blocks(blocks)
@@ -511,6 +541,7 @@ def process_pptx_advanced(input_file):
             image_stream = io.BytesIO(shape.image.blob)
             image = Image.open(image_stream).convert("RGB")
             image_np = np.array(image)
+            image_np = _resize_image_for_ocr(image_np)
             img_h, img_w = image_np.shape[:2]
             blocks, mask = _extract_text_blocks(reader, image_np)
             grouped_blocks = _group_ocr_blocks(blocks)
@@ -609,7 +640,7 @@ def _render_pdf_page_for_ocr(page):
     matrix = fitz.Matrix(OCR_RENDER_SCALE, OCR_RENDER_SCALE)
     pix = page.get_pixmap(matrix=matrix, alpha=False)
     image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-    return np.array(image)
+    return _resize_image_for_ocr(np.array(image))
 
 
 def _ocr_pdf_page(page, new_slide, reader):
@@ -699,7 +730,8 @@ def process_pdf_advanced(input_file):
 
 
 def process_image_advanced(input_file):
-    image = Image.open(input_file).convert("RGB")
+    image_bytes = input_file.read()
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     image_np = np.array(image)
     slide_width_pts, slide_height_pts = _fit_image_to_slide(image.width, image.height)
     output_prs = _build_output_presentation(slide_width_pts, slide_height_pts)
