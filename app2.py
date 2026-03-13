@@ -26,6 +26,8 @@ OCR_RENDER_SCALE = 2.0
 DEFAULT_IMAGE_WIDTH_PTS = 720
 MAX_SLIDE_DIMENSION_PTS = 4032
 MAX_OCR_IMAGE_SIDE_PX = 2200
+MIN_FONT_SIZE_PT = 10
+MAX_FONT_SIZE_PT = 30
 
 
 def _easyocr_cache_dir() -> str:
@@ -273,11 +275,24 @@ def _extract_text_blocks(reader, image_np: np.ndarray):
                 "top_px": top,
                 "width_px": right - left,
                 "height_px": bottom - top,
+                "right_px": right,
+                "bottom_px": bottom,
                 "confidence": float(prob),
             }
         )
 
     return blocks, mask
+
+
+def _looks_like_bullet(text):
+    stripped = text.lstrip()
+    return stripped.startswith(("-", "*", "\u2022", "\u25e6", "\u25aa"))
+
+
+def _estimate_font_size_from_line_height(line_height_px, img_h, shape_height_pts):
+    line_height_pts = (line_height_px / max(img_h, 1)) * shape_height_pts
+    estimated = line_height_pts * 0.8
+    return max(MIN_FONT_SIZE_PT, min(estimated, MAX_FONT_SIZE_PT))
 
 
 def _group_ocr_blocks(blocks):
@@ -325,14 +340,20 @@ def _group_ocr_blocks(blocks):
     normalized_lines = []
     for line in lines:
         items = sorted(line["items"], key=lambda item: item["left_px"])
+        text = " ".join(item["text"] for item in items).strip()
+        left_px = line["left_px"]
+        top_px = line["top_px"]
+        right_px = line["right_px"]
+        bottom_px = line["bottom_px"]
         normalized_lines.append(
             {
-                "text": " ".join(item["text"] for item in items).strip(),
-                "left_px": line["left_px"],
-                "top_px": line["top_px"],
-                "right_px": line["right_px"],
-                "bottom_px": line["bottom_px"],
+                "text": text,
+                "left_px": left_px,
+                "top_px": top_px,
+                "right_px": right_px,
+                "bottom_px": bottom_px,
                 "height_px": line["height_px"],
+                "bullet_like": _looks_like_bullet(text),
             }
         )
 
@@ -352,6 +373,8 @@ def _group_ocr_blocks(blocks):
                     "right_px": line["right_px"],
                     "bottom_px": line["bottom_px"],
                     "line_height_px": line["height_px"],
+                    "lines": [line],
+                    "bullet_like": line["bullet_like"],
                 }
             )
             continue
@@ -361,14 +384,33 @@ def _group_ocr_blocks(blocks):
         line_height_threshold = max(current["line_height_px"], line["height_px"]) * 2.2
         left_delta = abs(line["left_px"] - current["left_px"])
         max_left_delta = max(current["right_px"] - current["left_px"], 1) * 0.4
+        indent_shift = line["left_px"] - current["left_px"]
+        current_font_height = current["line_height_px"]
+        line_height_ratio = max(current_font_height, line["height_px"]) / max(
+            min(current_font_height, line["height_px"]),
+            1,
+        )
+        current_is_title_like = current_font_height >= line["height_px"] * 1.35 and len(
+            current["lines"]
+        ) == 1
+        different_structure = current["bullet_like"] != line["bullet_like"]
+        should_start_new_group = (
+            vertical_gap > line_height_threshold
+            or left_delta > max_left_delta
+            or indent_shift > max(current_font_height, line["height_px"]) * 0.75
+            or line_height_ratio > 1.45
+            or (current_is_title_like and not current["bullet_like"] and not line["bullet_like"])
+            or different_structure
+        )
 
-        if vertical_gap <= line_height_threshold and left_delta <= max_left_delta:
+        if not should_start_new_group:
             current["text"] = f"{current['text']}\n{line['text']}"
             current["left_px"] = min(current["left_px"], line["left_px"])
             current["top_px"] = min(current["top_px"], line["top_px"])
             current["right_px"] = max(current["right_px"], line["right_px"])
             current["bottom_px"] = max(current["bottom_px"], line["bottom_px"])
             current["line_height_px"] = max(current["line_height_px"], line["height_px"])
+            current["lines"].append(line)
         else:
             groups.append(
                 {
@@ -378,6 +420,8 @@ def _group_ocr_blocks(blocks):
                     "right_px": line["right_px"],
                     "bottom_px": line["bottom_px"],
                     "line_height_px": line["height_px"],
+                    "lines": [line],
+                    "bullet_like": line["bullet_like"],
                 }
             )
 
@@ -388,6 +432,7 @@ def _group_ocr_blocks(blocks):
             "top_px": group["top_px"],
             "width_px": group["right_px"] - group["left_px"],
             "height_px": group["bottom_px"] - group["top_px"],
+            "lines": group["lines"],
         }
         for group in groups
     ]
@@ -438,9 +483,15 @@ def _add_text_boxes(new_slide, blocks, img_w, img_h, shape):
         )
         text_frame = textbox.text_frame
         text_frame.word_wrap = True
-        paragraph = text_frame.paragraphs[0]
-        paragraph.text = block["text"]
-        paragraph.font.size = Pt(DEFAULT_FONT_SIZE_PT)
+        text_frame.clear()
+        lines = block.get("lines") or [{"text": block["text"], "height_px": block["height_px"]}]
+
+        for index, line in enumerate(lines):
+            paragraph = text_frame.paragraphs[0] if index == 0 else text_frame.add_paragraph()
+            paragraph.text = line["text"]
+            paragraph.font.size = Pt(
+                _estimate_font_size_from_line_height(line["height_px"], img_h, shape_height)
+            )
 
 
 def _build_output_presentation(width_pts=720, height_pts=540):
@@ -672,9 +723,13 @@ def _ocr_pdf_page(page, new_slide, reader):
         )
         text_frame = textbox.text_frame
         text_frame.word_wrap = True
-        paragraph = text_frame.paragraphs[0]
-        paragraph.text = block["text"]
-        paragraph.font.size = Pt(DEFAULT_FONT_SIZE_PT)
+        text_frame.clear()
+        for index, line in enumerate(block.get("lines", [])):
+            paragraph = text_frame.paragraphs[0] if index == 0 else text_frame.add_paragraph()
+            paragraph.text = line["text"]
+            paragraph.font.size = Pt(
+                _estimate_font_size_from_line_height(line["height_px"], img_h, page.rect.height)
+            )
 
     return len(blocks), len(grouped_blocks)
 
