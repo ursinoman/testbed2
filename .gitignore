@@ -184,3 +184,5 @@ cython_debug/
 native_elements_demo*.pptx
 fully_editable*.pptx
 ~$*.pptx
+native_pdf_demo*.pdf
+*_editable.pptx

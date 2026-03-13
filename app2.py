@@ -7,16 +7,22 @@ import easyocr
 import numpy as np
 import streamlit as st
 from PIL import Image
-from pptx.chart.data import CategoryChartData
 from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.util import Pt
+
+try:
+    import fitz
+except ImportError:  # pragma: no cover - handled in the UI/runtime path
+    fitz = None
 
 
 OCR_LANGUAGES = ["en"]
 MIN_OCR_CONFIDENCE = 0.2
 DEFAULT_FONT_SIZE_PT = 14
+OCR_RENDER_SCALE = 2.0
 
 
 def _easyocr_cache_dir() -> str:
@@ -102,7 +108,7 @@ def _copy_text_frame(source_text_frame, target_text_frame):
         paragraph.level = source_paragraph.level
 
         if source_paragraph.runs:
-            for run_index, source_run in enumerate(source_paragraph.runs):
+            for source_run in source_paragraph.runs:
                 run = paragraph.add_run()
                 run.text = source_run.text
                 _copy_font(source_run.font, run.font)
@@ -206,7 +212,9 @@ def _clone_chart_shape(shape, new_slide):
             shape.width,
             shape.height,
         )
-        placeholder.text_frame.text = "Chart detected. Auto-rebuild is not yet supported for this chart type."
+        placeholder.text_frame.text = (
+            "Chart detected. Auto-rebuild is not yet supported for this chart type."
+        )
         return False
 
 
@@ -304,11 +312,23 @@ def _add_text_boxes(new_slide, blocks, img_w, img_h, shape):
         paragraph.font.size = Pt(DEFAULT_FONT_SIZE_PT)
 
 
+def _build_output_presentation(width_pts=720, height_pts=540):
+    prs = Presentation()
+    prs.slide_width = Pt(width_pts)
+    prs.slide_height = Pt(height_pts)
+    return prs
+
+
+def _save_presentation(output_prs):
+    output_stream = io.BytesIO()
+    output_prs.save(output_stream)
+    output_stream.seek(0)
+    return output_stream.getvalue()
+
+
 def process_pptx_advanced(input_file):
     prs = Presentation(input_file)
-    output_prs = Presentation()
-    output_prs.slide_width = prs.slide_width
-    output_prs.slide_height = prs.slide_height
+    output_prs = _build_output_presentation(prs.slide_width.pt, prs.slide_height.pt)
     reader = load_ocr()
     report = {
         "slides_processed": len(prs.slides),
@@ -346,29 +366,290 @@ def process_pptx_advanced(input_file):
             _add_text_boxes(new_slide, blocks, img_w, img_h, shape)
             report["pictures_ocr"] += 1
 
-    output_stream = io.BytesIO()
-    output_prs.save(output_stream)
-    output_stream.seek(0)
-    return output_stream.getvalue(), report
+    return _save_presentation(output_prs), report
 
 
-st.title("Full PPTX Reconstructor")
-st.write("Converts flat slide screenshots into editable text overlays and cleaned images.")
+def _pdf_font_flags(span):
+    font_name = span.get("font", "") or ""
+    font_lower = font_name.lower()
+    return {
+        "bold": "bold" in font_lower,
+        "italic": "italic" in font_lower or "oblique" in font_lower,
+    }
 
-uploaded_file = st.file_uploader("Upload a PowerPoint deck", type="pptx")
 
-if uploaded_file and st.button("Extract Everything"):
-    with st.spinner("Decomposing slide images..."):
-        try:
-            result, report = process_pptx_advanced(uploaded_file)
-        except Exception as exc:
-            st.exception(exc)
+def _pdf_text_blocks(page_dict):
+    return [block for block in page_dict.get("blocks", []) if block.get("type") == 0]
+
+
+def _pdf_image_blocks(page_dict):
+    return [block for block in page_dict.get("blocks", []) if block.get("type") == 1]
+
+
+def _add_pdf_text_block(new_slide, block):
+    x0, y0, x1, y1 = block["bbox"]
+    width = max(x1 - x0, 1)
+    height = max(y1 - y0, 1)
+    textbox = new_slide.shapes.add_textbox(Pt(x0), Pt(y0), Pt(width), Pt(height))
+    text_frame = textbox.text_frame
+    text_frame.clear()
+    text_frame.word_wrap = True
+    paragraph_index = 0
+
+    for line in block.get("lines", []):
+        paragraph = (
+            text_frame.paragraphs[0]
+            if paragraph_index == 0
+            else text_frame.add_paragraph()
+        )
+        paragraph_index += 1
+
+        for span in line.get("spans", []):
+            text = span.get("text", "")
+            if not text:
+                continue
+
+            run = paragraph.add_run()
+            run.text = text
+            run.font.size = Pt(max(span.get("size", DEFAULT_FONT_SIZE_PT), 1))
+            if span.get("font"):
+                run.font.name = span["font"]
+
+            flags = _pdf_font_flags(span)
+            run.font.bold = flags["bold"]
+            run.font.italic = flags["italic"]
+
+    if not any(paragraph.text for paragraph in text_frame.paragraphs):
+        new_slide.shapes._spTree.remove(textbox._element)
+        return False
+
+    return True
+
+
+def _add_pdf_image_block(new_slide, block):
+    image_bytes = block.get("image")
+    if not image_bytes:
+        return False
+
+    x0, y0, x1, y1 = block["bbox"]
+    width = max(x1 - x0, 1)
+    height = max(y1 - y0, 1)
+    new_slide.shapes.add_picture(
+        io.BytesIO(image_bytes),
+        Pt(x0),
+        Pt(y0),
+        width=Pt(width),
+        height=Pt(height),
+    )
+    return True
+
+
+def _render_pdf_page_for_ocr(page):
+    matrix = fitz.Matrix(OCR_RENDER_SCALE, OCR_RENDER_SCALE)
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
+    image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    return np.array(image)
+
+
+def _ocr_pdf_page(page, new_slide, reader):
+    page_image = _render_pdf_page_for_ocr(page)
+    img_h, img_w = page_image.shape[:2]
+    blocks, mask = _extract_text_blocks(reader, page_image)
+    cleaned_image_bytes = _clean_image(page_image, mask)
+
+    new_slide.shapes.add_picture(
+        io.BytesIO(cleaned_image_bytes),
+        Pt(0),
+        Pt(0),
+        width=Pt(page.rect.width),
+        height=Pt(page.rect.height),
+    )
+
+    for block in blocks:
+        left = (block["left_px"] / img_w) * page.rect.width
+        top = (block["top_px"] / img_h) * page.rect.height
+        width = (block["width_px"] / img_w) * page.rect.width
+        height = (block["height_px"] / img_h) * page.rect.height
+
+        textbox = new_slide.shapes.add_textbox(
+            Pt(left),
+            Pt(top),
+            Pt(max(width, 1)),
+            Pt(max(height, 1)),
+        )
+        text_frame = textbox.text_frame
+        text_frame.word_wrap = True
+        paragraph = text_frame.paragraphs[0]
+        paragraph.text = block["text"]
+        paragraph.font.size = Pt(DEFAULT_FONT_SIZE_PT)
+
+    return len(blocks)
+
+
+def process_pdf_advanced(input_file):
+    if fitz is None:
+        raise ImportError("PyMuPDF is required for PDF support. Add pymupdf to the app dependencies.")
+
+    pdf_bytes = input_file.read()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if doc.page_count == 0:
+        raise ValueError("The uploaded PDF has no pages.")
+
+    first_page_rect = doc[0].rect
+    output_prs = _build_output_presentation(first_page_rect.width, first_page_rect.height)
+    reader = load_ocr()
+    report = {
+        "pages_processed": doc.page_count,
+        "pdf_text_blocks": 0,
+        "pdf_image_blocks": 0,
+        "pdf_pages_ocr": 0,
+        "pdf_ocr_blocks": 0,
+        "unsupported": 0,
+    }
+
+    for page in doc:
+        new_slide = output_prs.slides.add_slide(output_prs.slide_layouts[6])
+        page_dict = page.get_text("dict")
+        text_blocks = _pdf_text_blocks(page_dict)
+        image_blocks = _pdf_image_blocks(page_dict)
+        page_text_count = 0
+
+        for block in text_blocks:
+            if _add_pdf_text_block(new_slide, block):
+                page_text_count += 1
+
+        for block in image_blocks:
+            if _add_pdf_image_block(new_slide, block):
+                report["pdf_image_blocks"] += 1
+            else:
+                report["unsupported"] += 1
+
+        if page_text_count == 0:
+            report["pdf_pages_ocr"] += 1
+            report["pdf_ocr_blocks"] += _ocr_pdf_page(page, new_slide, reader)
         else:
-            st.success("Reconstruction complete.")
-            st.json(report)
-            st.download_button(
-                "Download reconstructed PPTX",
-                result,
-                "fully_editable.pptx",
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            report["pdf_text_blocks"] += page_text_count
+
+    return _save_presentation(output_prs), report
+
+
+def process_uploaded_file(uploaded_file):
+    extension = Path(uploaded_file.name).suffix.lower()
+
+    if extension == ".pptx":
+        result, report = process_pptx_advanced(uploaded_file)
+        return result, report, "pptx"
+
+    if extension == ".pdf":
+        result, report = process_pdf_advanced(uploaded_file)
+        return result, report, "pdf"
+
+    raise ValueError(f"Unsupported file type: {extension}")
+
+
+def _file_summary(uploaded_file):
+    extension = Path(uploaded_file.name).suffix.lower().lstrip(".").upper()
+    size_mb = uploaded_file.size / (1024 * 1024)
+    return extension, f"{size_mb:.2f} MB"
+
+
+def _render_summary_metrics(report, mode):
+    if mode == "pptx":
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Slides", report["slides_processed"])
+        col2.metric("OCR Pictures", report["pictures_ocr"])
+        col3.metric("Native Shapes", report["text_shapes"] + report["tables"] + report["charts"])
+        col4.metric("Unsupported", report["unsupported"])
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Pages", report["pages_processed"])
+    col2.metric("Native Text Blocks", report["pdf_text_blocks"])
+    col3.metric("Image Blocks", report["pdf_image_blocks"])
+    col4.metric("OCR Pages", report["pdf_pages_ocr"])
+
+
+def _render_report_highlights(report, mode):
+    if mode == "pptx":
+        if report["pictures_ocr"] > 0:
+            st.info(
+                f"Detected {report['pictures_ocr']} flattened picture slide elements. "
+                "These were rebuilt with OCR text overlays."
             )
+        if report["text_shapes"] + report["tables"] + report["charts"] > 0:
+            st.success(
+                f"Preserved {report['text_shapes']} text/shape elements, "
+                f"{report['tables']} tables, and {report['charts']} charts as native PowerPoint objects."
+            )
+        return
+
+    if report["pdf_pages_ocr"] > 0:
+        st.warning(
+            f"{report['pdf_pages_ocr']} PDF page(s) had no native text layer and were processed with OCR fallback."
+        )
+    else:
+        st.success("All PDF pages were reconstructed from native PDF text and image blocks.")
+
+    if report["pdf_text_blocks"] > 0:
+        st.info(f"Recovered {report['pdf_text_blocks']} native text block(s) as editable text boxes.")
+
+
+st.set_page_config(page_title="Deck And PDF Reconstructor", layout="wide")
+
+with st.sidebar:
+    st.subheader("What This Does")
+    st.write(
+        "Rebuilds uploaded decks and PDFs into editable PowerPoint output. Native elements stay editable "
+        "when possible, and OCR is used only when content is flattened."
+    )
+    st.subheader("Supported Inputs")
+    st.write("`PPTX`: native shapes, tables, charts, and screenshot-based OCR recovery")
+    st.write("`PDF`: native text blocks, embedded images, and OCR fallback for scanned pages")
+    st.subheader("Current Limits")
+    st.write("Complex vector graphics, SmartArt, and arbitrary PDF drawing paths are still best-effort.")
+
+st.title("Deck And PDF Reconstructor")
+st.caption(
+    "Upload a PowerPoint deck or PDF to reconstruct editable text, preserve native elements, "
+    "and separate flattened content into reusable pieces."
+)
+
+uploaded_file = st.file_uploader("Upload a `.pptx` or `.pdf` file", type=["pptx", "pdf"])
+
+if uploaded_file:
+    extension, size_label = _file_summary(uploaded_file)
+    preview_col1, preview_col2, preview_col3 = st.columns([1, 1, 2])
+    preview_col1.metric("Format", extension)
+    preview_col2.metric("Size", size_label)
+    preview_col3.info(
+        "Processing mode: native reconstruction first, OCR fallback only when editable structure is missing."
+    )
+
+    if st.button("Extract Everything", type="primary", use_container_width=True):
+        with st.spinner("Reconstructing editable content..."):
+            try:
+                result, report, mode = process_uploaded_file(uploaded_file)
+            except Exception as exc:
+                st.exception(exc)
+            else:
+                output_name = f"{Path(uploaded_file.name).stem}_editable.pptx"
+                st.success("Reconstruction complete.")
+                _render_summary_metrics(report, mode)
+                _render_report_highlights(report, mode)
+
+                details_col1, details_col2 = st.columns([3, 2])
+                with details_col1:
+                    st.subheader("Extraction Report")
+                    st.json(report)
+                with details_col2:
+                    st.subheader("Output")
+                    st.write("Your editable reconstruction is ready as a PowerPoint file.")
+                    st.download_button(
+                        "Download reconstructed PPTX",
+                        result,
+                        output_name,
+                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        use_container_width=True,
+                    )
+else:
+    st.info("Drop in a PowerPoint deck or PDF to see the extraction summary and download an editable PPTX.")
