@@ -23,6 +23,7 @@ OCR_LANGUAGES = ["en"]
 MIN_OCR_CONFIDENCE = 0.2
 DEFAULT_FONT_SIZE_PT = 14
 OCR_RENDER_SCALE = 2.0
+DEFAULT_IMAGE_WIDTH_PTS = 720
 
 
 def _easyocr_cache_dir() -> str:
@@ -277,6 +278,119 @@ def _extract_text_blocks(reader, image_np: np.ndarray):
     return blocks, mask
 
 
+def _group_ocr_blocks(blocks):
+    if not blocks:
+        return []
+
+    ordered_blocks = sorted(blocks, key=lambda block: (block["top_px"], block["left_px"]))
+    lines = []
+
+    for block in ordered_blocks:
+        block_center = block["top_px"] + (block["height_px"] / 2)
+        matched_line = None
+
+        for line in lines:
+            line_center = line["top_px"] + (line["height_px"] / 2)
+            vertical_threshold = max(line["height_px"], block["height_px"]) * 0.65
+            if abs(block_center - line_center) <= vertical_threshold:
+                matched_line = line
+                break
+
+        if matched_line is None:
+            lines.append(
+                {
+                    "items": [block],
+                    "left_px": block["left_px"],
+                    "top_px": block["top_px"],
+                    "right_px": block["left_px"] + block["width_px"],
+                    "bottom_px": block["top_px"] + block["height_px"],
+                    "height_px": block["height_px"],
+                }
+            )
+            continue
+
+        matched_line["items"].append(block)
+        matched_line["left_px"] = min(matched_line["left_px"], block["left_px"])
+        matched_line["top_px"] = min(matched_line["top_px"], block["top_px"])
+        matched_line["right_px"] = max(
+            matched_line["right_px"], block["left_px"] + block["width_px"]
+        )
+        matched_line["bottom_px"] = max(
+            matched_line["bottom_px"], block["top_px"] + block["height_px"]
+        )
+        matched_line["height_px"] = matched_line["bottom_px"] - matched_line["top_px"]
+
+    normalized_lines = []
+    for line in lines:
+        items = sorted(line["items"], key=lambda item: item["left_px"])
+        normalized_lines.append(
+            {
+                "text": " ".join(item["text"] for item in items).strip(),
+                "left_px": line["left_px"],
+                "top_px": line["top_px"],
+                "right_px": line["right_px"],
+                "bottom_px": line["bottom_px"],
+                "height_px": line["height_px"],
+            }
+        )
+
+    normalized_lines.sort(key=lambda line: (line["top_px"], line["left_px"]))
+    groups = []
+
+    for line in normalized_lines:
+        if not line["text"]:
+            continue
+
+        if not groups:
+            groups.append(
+                {
+                    "text": line["text"],
+                    "left_px": line["left_px"],
+                    "top_px": line["top_px"],
+                    "right_px": line["right_px"],
+                    "bottom_px": line["bottom_px"],
+                    "line_height_px": line["height_px"],
+                }
+            )
+            continue
+
+        current = groups[-1]
+        vertical_gap = line["top_px"] - current["bottom_px"]
+        line_height_threshold = max(current["line_height_px"], line["height_px"]) * 2.2
+        left_delta = abs(line["left_px"] - current["left_px"])
+        max_left_delta = max(current["right_px"] - current["left_px"], 1) * 0.4
+
+        if vertical_gap <= line_height_threshold and left_delta <= max_left_delta:
+            current["text"] = f"{current['text']}\n{line['text']}"
+            current["left_px"] = min(current["left_px"], line["left_px"])
+            current["top_px"] = min(current["top_px"], line["top_px"])
+            current["right_px"] = max(current["right_px"], line["right_px"])
+            current["bottom_px"] = max(current["bottom_px"], line["bottom_px"])
+            current["line_height_px"] = max(current["line_height_px"], line["height_px"])
+        else:
+            groups.append(
+                {
+                    "text": line["text"],
+                    "left_px": line["left_px"],
+                    "top_px": line["top_px"],
+                    "right_px": line["right_px"],
+                    "bottom_px": line["bottom_px"],
+                    "line_height_px": line["height_px"],
+                }
+            )
+
+    return [
+        {
+            "text": group["text"],
+            "left_px": group["left_px"],
+            "top_px": group["top_px"],
+            "width_px": group["right_px"] - group["left_px"],
+            "height_px": group["bottom_px"] - group["top_px"],
+        }
+        for group in groups
+    ]
+
+
 def _clean_image(image_np: np.ndarray, mask: np.ndarray) -> bytes:
     if np.count_nonzero(mask) == 0:
         cleaned_img_np = image_np
@@ -326,13 +440,59 @@ def _save_presentation(output_prs):
     return output_stream.getvalue()
 
 
+def _full_slide_shape(output_prs):
+    return type(
+        "ImageShapeBounds",
+        (),
+        {
+            "left": Pt(0),
+            "top": Pt(0),
+            "width": output_prs.slide_width,
+            "height": output_prs.slide_height,
+        },
+    )()
+
+
+def _fit_image_to_slide(image_width_px, image_height_px, target_width_pts=DEFAULT_IMAGE_WIDTH_PTS):
+    height_pts = target_width_pts * (image_height_px / max(image_width_px, 1))
+    return target_width_pts, max(height_pts, 1)
+
+
+def _process_flat_image(image_np, output_prs, report, report_key_prefix):
+    reader = load_ocr()
+    new_slide = output_prs.slides.add_slide(output_prs.slide_layouts[6])
+    img_h, img_w = image_np.shape[:2]
+    blocks, mask = _extract_text_blocks(reader, image_np)
+    grouped_blocks = _group_ocr_blocks(blocks)
+    cleaned_image_bytes = _clean_image(image_np, mask)
+
+    new_slide.shapes.add_picture(
+        io.BytesIO(cleaned_image_bytes),
+        Pt(0),
+        Pt(0),
+        width=output_prs.slide_width,
+        height=output_prs.slide_height,
+    )
+    _add_text_boxes(
+        new_slide,
+        grouped_blocks,
+        img_w,
+        img_h,
+        _full_slide_shape(output_prs),
+    )
+
+    report[f"{report_key_prefix}_ocr_regions"] += len(blocks)
+    report[f"{report_key_prefix}_text_groups"] += len(grouped_blocks)
+
+
 def process_pptx_advanced(input_file):
     prs = Presentation(input_file)
     output_prs = _build_output_presentation(prs.slide_width.pt, prs.slide_height.pt)
     reader = load_ocr()
     report = {
         "slides_processed": len(prs.slides),
-        "pictures_ocr": 0,
+        "pictures_ocr_regions": 0,
+        "pictures_text_groups": 0,
         "text_shapes": 0,
         "tables": 0,
         "charts": 0,
@@ -352,8 +512,8 @@ def process_pptx_advanced(input_file):
             image = Image.open(image_stream).convert("RGB")
             image_np = np.array(image)
             img_h, img_w = image_np.shape[:2]
-
             blocks, mask = _extract_text_blocks(reader, image_np)
+            grouped_blocks = _group_ocr_blocks(blocks)
             cleaned_image_bytes = _clean_image(image_np, mask)
 
             new_slide.shapes.add_picture(
@@ -363,8 +523,9 @@ def process_pptx_advanced(input_file):
                 width=shape.width,
                 height=shape.height,
             )
-            _add_text_boxes(new_slide, blocks, img_w, img_h, shape)
-            report["pictures_ocr"] += 1
+            _add_text_boxes(new_slide, grouped_blocks, img_w, img_h, shape)
+            report["pictures_ocr_regions"] += len(blocks)
+            report["pictures_text_groups"] += len(grouped_blocks)
 
     return _save_presentation(output_prs), report
 
@@ -455,6 +616,7 @@ def _ocr_pdf_page(page, new_slide, reader):
     page_image = _render_pdf_page_for_ocr(page)
     img_h, img_w = page_image.shape[:2]
     blocks, mask = _extract_text_blocks(reader, page_image)
+    grouped_blocks = _group_ocr_blocks(blocks)
     cleaned_image_bytes = _clean_image(page_image, mask)
 
     new_slide.shapes.add_picture(
@@ -465,7 +627,7 @@ def _ocr_pdf_page(page, new_slide, reader):
         height=Pt(page.rect.height),
     )
 
-    for block in blocks:
+    for block in grouped_blocks:
         left = (block["left_px"] / img_w) * page.rect.width
         top = (block["top_px"] / img_h) * page.rect.height
         width = (block["width_px"] / img_w) * page.rect.width
@@ -483,7 +645,7 @@ def _ocr_pdf_page(page, new_slide, reader):
         paragraph.text = block["text"]
         paragraph.font.size = Pt(DEFAULT_FONT_SIZE_PT)
 
-    return len(blocks)
+    return len(blocks), len(grouped_blocks)
 
 
 def process_pdf_advanced(input_file):
@@ -503,7 +665,8 @@ def process_pdf_advanced(input_file):
         "pdf_text_blocks": 0,
         "pdf_image_blocks": 0,
         "pdf_pages_ocr": 0,
-        "pdf_ocr_blocks": 0,
+        "pdf_ocr_regions": 0,
+        "pdf_ocr_groups": 0,
         "unsupported": 0,
     }
 
@@ -526,10 +689,26 @@ def process_pdf_advanced(input_file):
 
         if page_text_count == 0:
             report["pdf_pages_ocr"] += 1
-            report["pdf_ocr_blocks"] += _ocr_pdf_page(page, new_slide, reader)
+            ocr_regions, ocr_groups = _ocr_pdf_page(page, new_slide, reader)
+            report["pdf_ocr_regions"] += ocr_regions
+            report["pdf_ocr_groups"] += ocr_groups
         else:
             report["pdf_text_blocks"] += page_text_count
 
+    return _save_presentation(output_prs), report
+
+
+def process_image_advanced(input_file):
+    image = Image.open(input_file).convert("RGB")
+    image_np = np.array(image)
+    slide_width_pts, slide_height_pts = _fit_image_to_slide(image.width, image.height)
+    output_prs = _build_output_presentation(slide_width_pts, slide_height_pts)
+    report = {
+        "images_processed": 1,
+        "image_ocr_regions": 0,
+        "image_text_groups": 0,
+    }
+    _process_flat_image(image_np, output_prs, report, "image")
     return _save_presentation(output_prs), report
 
 
@@ -544,6 +723,10 @@ def process_uploaded_file(uploaded_file):
         result, report = process_pdf_advanced(uploaded_file)
         return result, report, "pdf"
 
+    if extension in {".png", ".jpg", ".jpeg"}:
+        result, report = process_image_advanced(uploaded_file)
+        return result, report, "image"
+
     raise ValueError(f"Unsupported file type: {extension}")
 
 
@@ -557,9 +740,16 @@ def _render_summary_metrics(report, mode):
     if mode == "pptx":
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Slides", report["slides_processed"])
-        col2.metric("OCR Pictures", report["pictures_ocr"])
-        col3.metric("Native Shapes", report["text_shapes"] + report["tables"] + report["charts"])
-        col4.metric("Unsupported", report["unsupported"])
+        col2.metric("OCR Regions", report["pictures_ocr_regions"])
+        col3.metric("Grouped Text Boxes", report["pictures_text_groups"])
+        col4.metric("Native Shapes", report["text_shapes"] + report["tables"] + report["charts"])
+        return
+
+    if mode == "image":
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Images", report["images_processed"])
+        col2.metric("OCR Regions", report["image_ocr_regions"])
+        col3.metric("Grouped Text Boxes", report["image_text_groups"])
         return
 
     col1, col2, col3, col4 = st.columns(4)
@@ -571,10 +761,10 @@ def _render_summary_metrics(report, mode):
 
 def _render_report_highlights(report, mode):
     if mode == "pptx":
-        if report["pictures_ocr"] > 0:
+        if report["pictures_ocr_regions"] > 0:
             st.info(
-                f"Detected {report['pictures_ocr']} flattened picture slide elements. "
-                "These were rebuilt with OCR text overlays."
+                f"Detected {report['pictures_ocr_regions']} OCR text region(s) inside flattened slide images "
+                f"and merged them into {report['pictures_text_groups']} larger editable text box(es)."
             )
         if report["text_shapes"] + report["tables"] + report["charts"] > 0:
             st.success(
@@ -583,10 +773,22 @@ def _render_report_highlights(report, mode):
             )
         return
 
+    if mode == "image":
+        st.success(
+            f"Grouped {report['image_ocr_regions']} OCR region(s) into {report['image_text_groups']} editable "
+            "text box(es) on a single-slide PowerPoint output."
+        )
+        return
+
     if report["pdf_pages_ocr"] > 0:
         st.warning(
             f"{report['pdf_pages_ocr']} PDF page(s) had no native text layer and were processed with OCR fallback."
         )
+        if report["pdf_ocr_regions"] > 0:
+            st.info(
+                f"OCR found {report['pdf_ocr_regions']} text region(s) and grouped them into "
+                f"{report['pdf_ocr_groups']} larger text box(es)."
+            )
     else:
         st.success("All PDF pages were reconstructed from native PDF text and image blocks.")
 
@@ -605,16 +807,20 @@ with st.sidebar:
     st.subheader("Supported Inputs")
     st.write("`PPTX`: native shapes, tables, charts, and screenshot-based OCR recovery")
     st.write("`PDF`: native text blocks, embedded images, and OCR fallback for scanned pages")
+    st.write("`PNG/JPG`: single-image OCR reconstruction into an editable one-slide PPTX")
     st.subheader("Current Limits")
     st.write("Complex vector graphics, SmartArt, and arbitrary PDF drawing paths are still best-effort.")
 
 st.title("Deck And PDF Reconstructor")
 st.caption(
-    "Upload a PowerPoint deck or PDF to reconstruct editable text, preserve native elements, "
+    "Upload a PowerPoint deck, PDF, or image to reconstruct editable text, preserve native elements, "
     "and separate flattened content into reusable pieces."
 )
 
-uploaded_file = st.file_uploader("Upload a `.pptx` or `.pdf` file", type=["pptx", "pdf"])
+uploaded_file = st.file_uploader(
+    "Upload a `.pptx`, `.pdf`, `.png`, `.jpg`, or `.jpeg` file",
+    type=["pptx", "pdf", "png", "jpg", "jpeg"],
+)
 
 if uploaded_file:
     extension, size_label = _file_summary(uploaded_file)
@@ -622,7 +828,7 @@ if uploaded_file:
     preview_col1.metric("Format", extension)
     preview_col2.metric("Size", size_label)
     preview_col3.info(
-        "Processing mode: native reconstruction first, OCR fallback only when editable structure is missing."
+        "Processing mode: native reconstruction first, with OCR regions merged into larger grouped text boxes."
     )
 
     if st.button("Extract Everything", type="primary", use_container_width=True):
@@ -652,4 +858,6 @@ if uploaded_file:
                         use_container_width=True,
                     )
 else:
-    st.info("Drop in a PowerPoint deck or PDF to see the extraction summary and download an editable PPTX.")
+    st.info(
+        "Drop in a PowerPoint deck, PDF, or image to see the extraction summary and download an editable PPTX."
+    )
