@@ -115,13 +115,21 @@ def _shape_bounds_object(left_pt, top_pt, width_pt, height_pt):
     )()
 
 
+def _pptx_length(value):
+    if hasattr(value, "emu"):
+        return value
+    if isinstance(value, (int, float)):
+        return Pt(value)
+    return value
+
+
 def _add_picture_from_blob(new_slide, image_blob, left, top, width, height):
     new_slide.shapes.add_picture(
         io.BytesIO(image_blob),
-        Pt(left) if isinstance(left, (int, float)) else left,
-        Pt(top) if isinstance(top, (int, float)) else top,
-        width=Pt(width) if isinstance(width, (int, float)) else width,
-        height=Pt(height) if isinstance(height, (int, float)) else height,
+        _pptx_length(left),
+        _pptx_length(top),
+        width=_pptx_length(width),
+        height=_pptx_length(height),
     )
 
 
