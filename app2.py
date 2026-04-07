@@ -329,6 +329,17 @@ def _clone_shape_as_is(shape, new_slide):
     return _clone_native_shape(shape, new_slide)
 
 
+def _clone_slide_as_is(source_slide, new_slide, report=None):
+    for shape in source_slide.shapes:
+        cloned, bucket = _clone_shape_as_is(shape, new_slide)
+        if report is None:
+            continue
+        if not cloned:
+            report["unsupported"] += 1
+        elif bucket in report:
+            report[bucket] += 1
+
+
 def _extract_text_blocks(reader, image_np: np.ndarray):
     results = reader.readtext(image_np)
     img_h, img_w = image_np.shape[:2]
@@ -675,31 +686,18 @@ def _process_flat_image(image_np, output_prs, report, report_key_prefix):
 
 def process_pptx_advanced(input_file, selection=None):
     prs = Presentation(input_file)
-    if selection and selection.get("enabled"):
-        slide = prs.slides[selection["page_number"] - 1]
-        selection_x, selection_y, selection_width, selection_height = _selection_bounds(
-            prs.slide_width.pt, prs.slide_height.pt, selection
-        )
-        output_prs = _build_output_presentation(prs.slide_width.pt, prs.slide_height.pt)
-        slides_to_process = [
-            (
-                slide,
-                selection_x,
-                selection_y,
-                selection_width,
-                selection_height,
-                True,
-            )
-        ]
-    else:
-        output_prs = _build_output_presentation(prs.slide_width.pt, prs.slide_height.pt)
-        slides_to_process = [
-            (slide, 0, 0, prs.slide_width.pt, prs.slide_height.pt, False) for slide in prs.slides
-        ]
+    selection_enabled = selection and selection.get("enabled")
+    selected_slide_index = (selection["page_number"] - 1) if selection_enabled else None
+    selection_x, selection_y, selection_width, selection_height = (
+        _selection_bounds(prs.slide_width.pt, prs.slide_height.pt, selection)
+        if selection_enabled
+        else (0, 0, prs.slide_width.pt, prs.slide_height.pt)
+    )
+    output_prs = _build_output_presentation(prs.slide_width.pt, prs.slide_height.pt)
 
     reader = load_ocr()
     report = {
-        "slides_processed": len(slides_to_process),
+        "slides_processed": len(prs.slides),
         "pictures_ocr_regions": 0,
         "pictures_text_groups": 0,
         "text_shapes": 0,
@@ -708,17 +706,19 @@ def process_pptx_advanced(input_file, selection=None):
         "unsupported": 0,
     }
 
-    for slide, selection_x, selection_y, selection_width, selection_height, selection_enabled in slides_to_process:
+    for slide_index, slide in enumerate(prs.slides):
         new_slide = output_prs.slides.add_slide(output_prs.slide_layouts[6])
-        selection_rect = _rect_from_xywh(selection_x, selection_y, selection_width, selection_height)
+        if not selection_enabled:
+            selection_rect = _rect_from_xywh(0, 0, prs.slide_width.pt, prs.slide_height.pt)
+        else:
+            selection_rect = _rect_from_xywh(selection_x, selection_y, selection_width, selection_height)
+
+        if selection_enabled and slide_index != selected_slide_index:
+            _clone_slide_as_is(slide, new_slide)
+            continue
 
         if selection_enabled:
-            for shape in slide.shapes:
-                cloned, bucket = _clone_shape_as_is(shape, new_slide)
-                if not cloned:
-                    report["unsupported"] += 1
-                elif bucket in report:
-                    report[bucket] += 1
+            _clone_slide_as_is(slide, new_slide)
 
         for shape in slide.shapes:
             shape_left, shape_top, shape_width, shape_height = _shape_bounds_to_points(shape)
@@ -730,10 +730,6 @@ def process_pptx_advanced(input_file, selection=None):
             if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
                 if selection_enabled:
                     continue
-                if not _rect_contains(selection_rect, shape_rect):
-                    report["unsupported"] += 1
-                    continue
-
                 _, bucket = _clone_native_shape(shape, new_slide, selection_x, selection_y)
                 report[bucket] += 1
                 continue
@@ -934,22 +930,18 @@ def process_pdf_advanced(input_file, selection=None):
     if doc.page_count == 0:
         raise ValueError("The uploaded PDF has no pages.")
 
-    if selection and selection.get("enabled"):
-        pages_to_process = [doc[selection["page_number"] - 1]]
-        selection_x, selection_y, selection_width, selection_height = _selection_bounds(
-            pages_to_process[0].rect.width, pages_to_process[0].rect.height, selection
-        )
-        output_prs = _build_output_presentation(
-            pages_to_process[0].rect.width, pages_to_process[0].rect.height
-        )
-    else:
-        pages_to_process = list(doc)
-        first_page_rect = doc[0].rect
-        selection_x, selection_y, selection_width, selection_height = 0, 0, first_page_rect.width, first_page_rect.height
-        output_prs = _build_output_presentation(first_page_rect.width, first_page_rect.height)
+    selection_enabled = selection and selection.get("enabled")
+    selected_page_index = (selection["page_number"] - 1) if selection_enabled else None
+    first_page_rect = doc[0].rect
+    output_prs = _build_output_presentation(first_page_rect.width, first_page_rect.height)
+    selection_x, selection_y, selection_width, selection_height = (
+        _selection_bounds(doc[selected_page_index].rect.width, doc[selected_page_index].rect.height, selection)
+        if selection_enabled
+        else (0, 0, first_page_rect.width, first_page_rect.height)
+    )
     reader = load_ocr()
     report = {
-        "pages_processed": len(pages_to_process),
+        "pages_processed": doc.page_count,
         "pdf_text_blocks": 0,
         "pdf_image_blocks": 0,
         "pdf_pages_ocr": 0,
@@ -958,10 +950,9 @@ def process_pdf_advanced(input_file, selection=None):
         "unsupported": 0,
     }
 
-    for page in pages_to_process:
+    for page_index, page in enumerate(doc):
         new_slide = output_prs.slides.add_slide(output_prs.slide_layouts[6])
         page_selection_rect = _rect_from_xywh(selection_x, selection_y, selection_width, selection_height)
-        selection_enabled = selection and selection.get("enabled")
 
         if selection_enabled:
             _add_picture_from_blob(
@@ -972,6 +963,9 @@ def process_pdf_advanced(input_file, selection=None):
                 Pt(page.rect.width),
                 Pt(page.rect.height),
             )
+
+            if page_index != selected_page_index:
+                continue
 
             page_image = _render_pdf_page_for_ocr(page)
             scale_x = page_image.shape[1] / max(page.rect.width, 1)
