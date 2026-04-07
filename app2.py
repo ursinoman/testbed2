@@ -6,7 +6,7 @@ import cv2
 import easyocr
 import numpy as np
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw
 from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
@@ -75,6 +75,17 @@ def _rect_contains(outer_rect, inner_rect):
         and inner_rect[2] <= outer_rect[2]
         and inner_rect[3] <= outer_rect[3]
     )
+
+
+def _sanitize_crop_rect(rect, max_width, max_height):
+    left, top, right, bottom = rect
+    left = int(max(0, min(round(left), max_width - 1)))
+    top = int(max(0, min(round(top), max_height - 1)))
+    right = int(max(0, min(round(right), max_width)))
+    bottom = int(max(0, min(round(bottom), max_height)))
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
 
 
 def _selection_bounds(width, height, selection):
@@ -605,13 +616,20 @@ def _fit_image_to_slide(image_width_px, image_height_px, target_width_pts=DEFAUL
 
 
 def _crop_array_to_rect(image_np, rect):
-    left, top, right, bottom = rect
-    return image_np[int(top):int(bottom), int(left):int(right)]
+    safe_rect = _sanitize_crop_rect(rect, image_np.shape[1], image_np.shape[0])
+    if safe_rect is None:
+        return None
+    left, top, right, bottom = safe_rect
+    cropped = image_np[top:bottom, left:right]
+    return cropped if cropped.size else None
 
 
 def _crop_pil_bytes_to_rect(image_bytes, rect_px):
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    cropped = image.crop(rect_px)
+    safe_rect = _sanitize_crop_rect(rect_px, image.size[0], image.size[1])
+    if safe_rect is None:
+        return None
+    cropped = image.crop(safe_rect)
     buffer = io.BytesIO()
     cropped.save(buffer, format="PNG")
     buffer.seek(0)
@@ -619,6 +637,10 @@ def _crop_pil_bytes_to_rect(image_bytes, rect_px):
 
 
 def _overlay_editable_region(new_slide, image_np, target_shape, report, report_key_prefix):
+    if image_np is None or image_np.size == 0:
+        report["unsupported"] += 1
+        return
+
     reader = load_ocr()
     image_np = _resize_image_for_ocr(image_np)
     img_h, img_w = image_np.shape[:2]
@@ -724,6 +746,9 @@ def process_pptx_advanced(input_file, selection=None):
             crop_right = ((intersection[2] - shape_left) / max(shape_width, 1)) * image_np.shape[1]
             crop_bottom = ((intersection[3] - shape_top) / max(shape_height, 1)) * image_np.shape[0]
             image_np = _crop_array_to_rect(image_np, (crop_left, crop_top, crop_right, crop_bottom))
+            if image_np is None:
+                report["unsupported"] += 1
+                continue
             target_shape = _shape_bounds_object(
                 intersection[0] if selection_enabled else intersection[0] - selection_x,
                 intersection[1] if selection_enabled else intersection[1] - selection_y,
@@ -813,11 +838,14 @@ def _add_pdf_image_block(new_slide, block, offset_x=0, offset_y=0, selection_rec
         clipped = _rect_intersection((x0, y0, x1, y1), selection_rect)
         if clipped is None:
             return False
-        crop_left = ((clipped[0] - x0) / max(x1 - x0, 1)) * Image.open(io.BytesIO(image_bytes)).size[0]
-        crop_top = ((clipped[1] - y0) / max(y1 - y0, 1)) * Image.open(io.BytesIO(image_bytes)).size[1]
-        crop_right = ((clipped[2] - x0) / max(x1 - x0, 1)) * Image.open(io.BytesIO(image_bytes)).size[0]
-        crop_bottom = ((clipped[3] - y0) / max(y1 - y0, 1)) * Image.open(io.BytesIO(image_bytes)).size[1]
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        crop_left = ((clipped[0] - x0) / max(x1 - x0, 1)) * image.size[0]
+        crop_top = ((clipped[1] - y0) / max(y1 - y0, 1)) * image.size[1]
+        crop_right = ((clipped[2] - x0) / max(x1 - x0, 1)) * image.size[0]
+        crop_bottom = ((clipped[3] - y0) / max(y1 - y0, 1)) * image.size[1]
         image_bytes = _crop_pil_bytes_to_rect(image_bytes, (crop_left, crop_top, crop_right, crop_bottom))
+        if image_bytes is None:
+            return False
         x0, y0, x1, y1 = clipped
     width = max(x1 - x0, 1)
     height = max(y1 - y0, 1)
@@ -955,6 +983,9 @@ def process_pdf_advanced(input_file, selection=None):
                 (selection_y + selection_height) * scale_y,
             )
             selected_image = _crop_array_to_rect(page_image, crop_rect)
+            if selected_image is None:
+                report["unsupported"] += 1
+                continue
             _overlay_editable_region(
                 new_slide,
                 selected_image,
@@ -1010,6 +1041,8 @@ def process_image_advanced(input_file, selection=None):
             image_np,
             (selection_x, selection_y, selection_x + selection_width, selection_y + selection_height),
         )
+        if cropped_np is None:
+            raise ValueError("The selected image region is empty. Please choose a larger area.")
         slide_width_pts, slide_height_pts = _fit_image_to_slide(image.width, image.height)
     else:
         slide_width_pts, slide_height_pts = _fit_image_to_slide(image.width, image.height)
@@ -1085,6 +1118,50 @@ def _uploaded_file_page_count(uploaded_file):
     return 1
 
 
+def _selection_preset_values(preset):
+    presets = {
+        "Full canvas": (0, 0, 100, 100),
+        "Top half": (0, 0, 100, 50),
+        "Bottom half": (0, 50, 100, 50),
+        "Left half": (0, 0, 50, 100),
+        "Right half": (50, 0, 50, 100),
+        "Center": (20, 20, 60, 60),
+    }
+    return presets.get(preset)
+
+
+def _preview_image_for_selection(uploaded_file, selection):
+    extension = Path(uploaded_file.name).suffix.lower()
+    data = uploaded_file.getvalue()
+
+    if extension in {".png", ".jpg", ".jpeg"}:
+        return Image.open(io.BytesIO(data)).convert("RGB")
+
+    if extension == ".pdf" and fitz is not None:
+        doc = fitz.open(stream=data, filetype="pdf")
+        page = doc[(selection.get("page_number", 1) or 1) - 1]
+        pix = page.get_pixmap(matrix=fitz.Matrix(0.4, 0.4), alpha=False)
+        return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+
+    if extension == ".pptx":
+        prs = Presentation(io.BytesIO(data))
+        slide = prs.slides[(selection.get("page_number", 1) or 1) - 1]
+        picture_shapes = [shape for shape in slide.shapes if shape.shape_type == MSO_SHAPE_TYPE.PICTURE]
+        if len(picture_shapes) == 1:
+            return Image.open(io.BytesIO(picture_shapes[0].image.blob)).convert("RGB")
+
+    return None
+
+
+def _selection_preview_with_overlay(preview_image, selection):
+    preview = preview_image.copy()
+    draw = ImageDraw.Draw(preview)
+    x, y, width, height = _selection_bounds(preview.width, preview.height, selection)
+    rect = [x, y, x + width, y + height]
+    draw.rectangle(rect, outline=(220, 38, 38), width=max(2, preview.width // 200))
+    return preview
+
+
 def _selection_controls(uploaded_file):
     selection = {"enabled": False}
     with st.expander("Selective Extraction", expanded=False):
@@ -1111,22 +1188,52 @@ def _selection_controls(uploaded_file):
         else:
             selection["page_number"] = 1
 
-        selection["x_pct"] = st.slider("Left (%)", min_value=0, max_value=95, value=0, step=1)
-        selection["y_pct"] = st.slider("Top (%)", min_value=0, max_value=95, value=0, step=1)
-        selection["width_pct"] = st.slider(
-            "Width (%)",
-            min_value=1,
-            max_value=max(1, 100 - selection["x_pct"]),
-            value=max(1, 100 - selection["x_pct"]),
-            step=1,
+        preset = st.selectbox(
+            "Selection preset",
+            ["Custom", "Full canvas", "Top half", "Bottom half", "Left half", "Right half", "Center"],
         )
-        selection["height_pct"] = st.slider(
-            "Height (%)",
-            min_value=1,
-            max_value=max(1, 100 - selection["y_pct"]),
-            value=max(1, 100 - selection["y_pct"]),
-            step=1,
-        )
+        preset_values = _selection_preset_values(preset)
+
+        if preset_values is None:
+            selection["x_pct"] = st.slider("Left (%)", min_value=0, max_value=95, value=0, step=1)
+            selection["y_pct"] = st.slider("Top (%)", min_value=0, max_value=95, value=0, step=1)
+            selection["width_pct"] = st.slider(
+                "Width (%)",
+                min_value=1,
+                max_value=max(1, 100 - selection["x_pct"]),
+                value=max(1, 100 - selection["x_pct"]),
+                step=1,
+            )
+            selection["height_pct"] = st.slider(
+                "Height (%)",
+                min_value=1,
+                max_value=max(1, 100 - selection["y_pct"]),
+                value=max(1, 100 - selection["y_pct"]),
+                step=1,
+            )
+        else:
+            (
+                selection["x_pct"],
+                selection["y_pct"],
+                selection["width_pct"],
+                selection["height_pct"],
+            ) = preset_values
+            st.caption(
+                f"Preset region: left {selection['x_pct']}%, top {selection['y_pct']}%, "
+                f"width {selection['width_pct']}%, height {selection['height_pct']}%."
+            )
+
+        preview_image = _preview_image_for_selection(uploaded_file, selection)
+        if preview_image is not None:
+            st.image(
+                _selection_preview_with_overlay(preview_image, selection),
+                caption="Selection preview",
+                use_container_width=True,
+            )
+        else:
+            st.caption(
+                "Preview is currently available for images, PDFs, and PowerPoint slides that contain a single picture."
+            )
 
         st.caption(
             "The selected region is defined as a percentage of the current slide, page, or image and is rebuilt "
