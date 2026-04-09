@@ -1,5 +1,6 @@
 import io
 import os
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -29,10 +30,19 @@ MAX_OCR_IMAGE_SIDE_PX = 2200
 MIN_FONT_SIZE_PT = 10
 MAX_FONT_SIZE_PT = 30
 
+# OCR grouping thresholds — tune these if text is being split or merged incorrectly
+LINE_MERGE_OVERLAP_RATIO = 0.65      # max vertical distance (relative to line height) to merge into same line
+PARAGRAPH_GAP_MULTIPLIER = 2.2       # gap larger than this × line height starts a new group
+GROUP_LEFT_DELTA_RATIO = 0.4         # left-edge shift larger than this × group width starts a new group
+INDENT_SHIFT_MULTIPLIER = 0.75       # x-shift larger than this × line height is treated as a new indent group
+LINE_HEIGHT_RATIO_THRESHOLD = 1.45   # font size ratio above this splits into separate groups (title vs body)
+TITLE_HEIGHT_RATIO = 1.35            # single-line group is treated as a title if taller than body by this ratio
+
 
 def _easyocr_cache_dir() -> str:
     # Streamlit deployments can fail if EasyOCR tries to write under HOME.
-    cache_dir = Path(os.getenv("EASYOCR_MODULE_STORAGE", "/tmp/easyocr"))
+    default_cache = str(Path(tempfile.gettempdir()) / "easyocr")
+    cache_dir = Path(os.getenv("EASYOCR_MODULE_STORAGE", default_cache))
     cache_dir.mkdir(parents=True, exist_ok=True)
     return str(cache_dir)
 
@@ -348,6 +358,21 @@ def _clone_slide_as_is(source_slide, new_slide, report=None):
             report[bucket] += 1
 
 
+def _clone_slide_native_shapes(source_slide, new_slide, report=None):
+    """Clone only non-picture native shapes (text, tables, charts). Used when pictures
+    in the selection region will be handled separately with OCR overlays."""
+    for shape in source_slide.shapes:
+        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+            continue
+        cloned, bucket = _clone_native_shape(shape, new_slide)
+        if report is None:
+            continue
+        if not cloned:
+            report["unsupported"] += 1
+        elif bucket in report:
+            report[bucket] += 1
+
+
 def _extract_text_blocks(reader, image_np: np.ndarray):
     results = reader.readtext(image_np)
     img_h, img_w = image_np.shape[:2]
@@ -413,7 +438,7 @@ def _group_ocr_blocks(blocks):
 
         for line in lines:
             line_center = line["top_px"] + (line["height_px"] / 2)
-            vertical_threshold = max(line["height_px"], block["height_px"]) * 0.65
+            vertical_threshold = max(line["height_px"], block["height_px"]) * LINE_MERGE_OVERLAP_RATIO
             if abs(block_center - line_center) <= vertical_threshold:
                 matched_line = line
                 break
@@ -486,24 +511,24 @@ def _group_ocr_blocks(blocks):
 
         current = groups[-1]
         vertical_gap = line["top_px"] - current["bottom_px"]
-        line_height_threshold = max(current["line_height_px"], line["height_px"]) * 2.2
+        line_height_threshold = max(current["line_height_px"], line["height_px"]) * PARAGRAPH_GAP_MULTIPLIER
         left_delta = abs(line["left_px"] - current["left_px"])
-        max_left_delta = max(current["right_px"] - current["left_px"], 1) * 0.4
+        max_left_delta = max(current["right_px"] - current["left_px"], 1) * GROUP_LEFT_DELTA_RATIO
         indent_shift = line["left_px"] - current["left_px"]
         current_font_height = current["line_height_px"]
         line_height_ratio = max(current_font_height, line["height_px"]) / max(
             min(current_font_height, line["height_px"]),
             1,
         )
-        current_is_title_like = current_font_height >= line["height_px"] * 1.35 and len(
+        current_is_title_like = current_font_height >= line["height_px"] * TITLE_HEIGHT_RATIO and len(
             current["lines"]
         ) == 1
         different_structure = current["bullet_like"] != line["bullet_like"]
         should_start_new_group = (
             vertical_gap > line_height_threshold
             or left_delta > max_left_delta
-            or indent_shift > max(current_font_height, line["height_px"]) * 0.75
-            or line_height_ratio > 1.45
+            or indent_shift > max(current_font_height, line["height_px"]) * INDENT_SHIFT_MULTIPLIER
+            or line_height_ratio > LINE_HEIGHT_RATIO_THRESHOLD
             or (current_is_title_like and not current["bullet_like"] and not line["bullet_like"])
             or different_structure
         )
@@ -692,7 +717,7 @@ def _process_flat_image(image_np, output_prs, report, report_key_prefix):
     _overlay_editable_region(new_slide, image_np, _full_slide_shape(output_prs), report, report_key_prefix)
 
 
-def process_pptx_advanced(input_file, selection=None):
+def process_pptx_advanced(input_file, selection=None, progress_callback=None):
     prs = Presentation(input_file)
     selection_enabled = selection and selection.get("enabled")
     selected_slide_index = (selection["page_number"] - 1) if selection_enabled else None
@@ -704,8 +729,9 @@ def process_pptx_advanced(input_file, selection=None):
     output_prs = _build_output_presentation(prs.slide_width.pt, prs.slide_height.pt)
 
     reader = load_ocr()
+    total_slides = len(prs.slides)
     report = {
-        "slides_processed": len(prs.slides),
+        "slides_processed": total_slides,
         "pictures_ocr_regions": 0,
         "pictures_text_groups": 0,
         "text_shapes": 0,
@@ -715,6 +741,9 @@ def process_pptx_advanced(input_file, selection=None):
     }
 
     for slide_index, slide in enumerate(prs.slides):
+        if progress_callback:
+            progress_callback(slide_index, total_slides)
+
         new_slide = output_prs.slides.add_slide(output_prs.slide_layouts[6])
         if not selection_enabled:
             selection_rect = _rect_from_xywh(0, 0, prs.slide_width.pt, prs.slide_height.pt)
@@ -726,22 +755,37 @@ def process_pptx_advanced(input_file, selection=None):
             continue
 
         if selection_enabled:
-            _clone_slide_as_is(slide, new_slide)
+            # Only clone native shapes (text, tables, charts) here.
+            # Pictures are handled below: OCR overlay if inside the selection,
+            # or cloned as-is if outside — avoids double-adding picture content.
+            _clone_slide_native_shapes(slide, new_slide, report)
 
         for shape in slide.shapes:
             shape_left, shape_top, shape_width, shape_height = _shape_bounds_to_points(shape)
             shape_rect = _rect_from_xywh(shape_left, shape_top, shape_width, shape_height)
             intersection = _rect_intersection(shape_rect, selection_rect)
-            if intersection is None:
-                continue
 
             if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
                 if selection_enabled:
-                    continue
+                    continue  # already handled by _clone_slide_native_shapes above
                 _, bucket = _clone_native_shape(shape, new_slide, selection_x, selection_y)
                 report[bucket] += 1
                 continue
 
+            # Picture shape: if outside the selection region, clone it as-is
+            if intersection is None:
+                if selection_enabled:
+                    _add_picture_from_blob(
+                        new_slide,
+                        shape.image.blob,
+                        shape.left,
+                        shape.top,
+                        shape.width,
+                        shape.height,
+                    )
+                continue
+
+            # Picture intersects the selection region — apply OCR overlay
             image_stream = io.BytesIO(shape.image.blob)
             image = Image.open(image_stream).convert("RGB")
             image_np = np.array(image)
@@ -766,6 +810,9 @@ def process_pptx_advanced(input_file, selection=None):
                 report,
                 "pictures",
             )
+
+    if progress_callback:
+        progress_callback(total_slides, total_slides)
 
     return _save_presentation(output_prs), report
 
@@ -929,104 +976,111 @@ def _ocr_pdf_page(page, new_slide, reader, selection_rect=None, offset_x=0, offs
     return len(blocks), len(grouped_blocks)
 
 
-def process_pdf_advanced(input_file, selection=None):
+def process_pdf_advanced(input_file, selection=None, progress_callback=None):
     if fitz is None:
         raise ImportError("PyMuPDF is required for PDF support. Add pymupdf to the app dependencies.")
 
     pdf_bytes = input_file.read()
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    if doc.page_count == 0:
-        raise ValueError("The uploaded PDF has no pages.")
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        if doc.page_count == 0:
+            raise ValueError("The uploaded PDF has no pages.")
 
-    selection_enabled = selection and selection.get("enabled")
-    selected_page_index = (selection["page_number"] - 1) if selection_enabled else None
-    first_page_rect = doc[0].rect
-    output_prs = _build_output_presentation(first_page_rect.width, first_page_rect.height)
-    selection_x, selection_y, selection_width, selection_height = (
-        _selection_bounds(doc[selected_page_index].rect.width, doc[selected_page_index].rect.height, selection)
-        if selection_enabled
-        else (0, 0, first_page_rect.width, first_page_rect.height)
-    )
-    reader = load_ocr()
-    report = {
-        "pages_processed": doc.page_count,
-        "pdf_text_blocks": 0,
-        "pdf_image_blocks": 0,
-        "pdf_pages_ocr": 0,
-        "pdf_ocr_regions": 0,
-        "pdf_ocr_groups": 0,
-        "unsupported": 0,
-    }
+        selection_enabled = selection and selection.get("enabled")
+        selected_page_index = (selection["page_number"] - 1) if selection_enabled else None
+        first_page_rect = doc[0].rect
+        output_prs = _build_output_presentation(first_page_rect.width, first_page_rect.height)
+        selection_x, selection_y, selection_width, selection_height = (
+            _selection_bounds(doc[selected_page_index].rect.width, doc[selected_page_index].rect.height, selection)
+            if selection_enabled
+            else (0, 0, first_page_rect.width, first_page_rect.height)
+        )
+        reader = load_ocr()
+        total_pages = doc.page_count
+        report = {
+            "pages_processed": total_pages,
+            "pdf_text_blocks": 0,
+            "pdf_image_blocks": 0,
+            "pdf_pages_ocr": 0,
+            "pdf_ocr_regions": 0,
+            "pdf_ocr_groups": 0,
+            "unsupported": 0,
+        }
 
-    for page_index, page in enumerate(doc):
-        new_slide = output_prs.slides.add_slide(output_prs.slide_layouts[6])
-        page_selection_rect = _rect_from_xywh(selection_x, selection_y, selection_width, selection_height)
+        for page_index, page in enumerate(doc):
+            if progress_callback:
+                progress_callback(page_index, total_pages)
 
-        if selection_enabled:
-            _add_picture_from_blob(
-                new_slide,
-                _render_pdf_page_image(page),
-                Pt(0),
-                Pt(0),
-                Pt(page.rect.width),
-                Pt(page.rect.height),
-            )
+            new_slide = output_prs.slides.add_slide(output_prs.slide_layouts[6])
+            page_selection_rect = _rect_from_xywh(selection_x, selection_y, selection_width, selection_height)
 
-            if page_index != selected_page_index:
+            if selection_enabled:
+                _add_picture_from_blob(
+                    new_slide,
+                    _render_pdf_page_image(page),
+                    Pt(0),
+                    Pt(0),
+                    Pt(page.rect.width),
+                    Pt(page.rect.height),
+                )
+
+                if page_index != selected_page_index:
+                    continue
+
+                page_image = _render_pdf_page_for_ocr(page)
+                scale_x = page_image.shape[1] / max(page.rect.width, 1)
+                scale_y = page_image.shape[0] / max(page.rect.height, 1)
+                crop_rect = (
+                    selection_x * scale_x,
+                    selection_y * scale_y,
+                    (selection_x + selection_width) * scale_x,
+                    (selection_y + selection_height) * scale_y,
+                )
+                selected_image = _crop_array_to_rect(page_image, crop_rect)
+                if selected_image is None:
+                    report["unsupported"] += 1
+                    continue
+                _overlay_editable_region(
+                    new_slide,
+                    selected_image,
+                    _shape_bounds_object(selection_x, selection_y, selection_width, selection_height),
+                    report,
+                    "pdf_ocr",
+                )
+                report["pdf_pages_ocr"] += 1
                 continue
 
-            page_image = _render_pdf_page_for_ocr(page)
-            scale_x = page_image.shape[1] / max(page.rect.width, 1)
-            scale_y = page_image.shape[0] / max(page.rect.height, 1)
-            crop_rect = (
-                selection_x * scale_x,
-                selection_y * scale_y,
-                (selection_x + selection_width) * scale_x,
-                (selection_y + selection_height) * scale_y,
-            )
-            selected_image = _crop_array_to_rect(page_image, crop_rect)
-            if selected_image is None:
-                report["unsupported"] += 1
-                continue
-            _overlay_editable_region(
-                new_slide,
-                selected_image,
-                _shape_bounds_object(selection_x, selection_y, selection_width, selection_height),
-                report,
-                "pdf_ocr",
-            )
-            report["pdf_pages_ocr"] += 1
-            continue
+            page_dict = page.get_text("dict")
+            text_blocks = _pdf_text_blocks(page_dict)
+            image_blocks = _pdf_image_blocks(page_dict)
+            page_text_count = 0
 
-        page_dict = page.get_text("dict")
-        text_blocks = _pdf_text_blocks(page_dict)
-        image_blocks = _pdf_image_blocks(page_dict)
-        page_text_count = 0
+            for block in text_blocks:
+                if _add_pdf_text_block(new_slide, block, selection_x, selection_y, page_selection_rect):
+                    page_text_count += 1
 
-        for block in text_blocks:
-            if _add_pdf_text_block(new_slide, block, selection_x, selection_y, page_selection_rect):
-                page_text_count += 1
+            for block in image_blocks:
+                if _add_pdf_image_block(new_slide, block, selection_x, selection_y, page_selection_rect):
+                    report["pdf_image_blocks"] += 1
+                else:
+                    report["unsupported"] += 1
 
-        for block in image_blocks:
-            if _add_pdf_image_block(new_slide, block, selection_x, selection_y, page_selection_rect):
-                report["pdf_image_blocks"] += 1
+            if page_text_count == 0:
+                report["pdf_pages_ocr"] += 1
+                ocr_regions, ocr_groups = _ocr_pdf_page(
+                    page,
+                    new_slide,
+                    reader,
+                    page_selection_rect if selection and selection.get("enabled") else None,
+                    selection_x,
+                    selection_y,
+                )
+                report["pdf_ocr_regions"] += ocr_regions
+                report["pdf_ocr_groups"] += ocr_groups
             else:
-                report["unsupported"] += 1
+                report["pdf_text_blocks"] += page_text_count
 
-        if page_text_count == 0:
-            report["pdf_pages_ocr"] += 1
-            ocr_regions, ocr_groups = _ocr_pdf_page(
-                page,
-                new_slide,
-                reader,
-                page_selection_rect if selection and selection.get("enabled") else None,
-                selection_x,
-                selection_y,
-            )
-            report["pdf_ocr_regions"] += ocr_regions
-            report["pdf_ocr_groups"] += ocr_groups
-        else:
-            report["pdf_text_blocks"] += page_text_count
+        if progress_callback:
+            progress_callback(total_pages, total_pages)
 
     return _save_presentation(output_prs), report
 
@@ -1083,15 +1137,15 @@ def process_image_advanced(input_file, selection=None):
     return _save_presentation(output_prs), report
 
 
-def process_uploaded_file(uploaded_file, selection=None):
+def process_uploaded_file(uploaded_file, selection=None, progress_callback=None):
     extension = Path(uploaded_file.name).suffix.lower()
 
     if extension == ".pptx":
-        result, report = process_pptx_advanced(uploaded_file, selection)
+        result, report = process_pptx_advanced(uploaded_file, selection, progress_callback)
         return result, report, "pptx"
 
     if extension == ".pdf":
-        result, report = process_pdf_advanced(uploaded_file, selection)
+        result, report = process_pdf_advanced(uploaded_file, selection, progress_callback)
         return result, report, "pdf"
 
     if extension in {".png", ".jpg", ".jpeg"}:
@@ -1115,7 +1169,8 @@ def _uploaded_file_page_count(uploaded_file):
         return len(Presentation(io.BytesIO(data)).slides)
 
     if extension == ".pdf" and fitz is not None:
-        return fitz.open(stream=data, filetype="pdf").page_count
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            return doc.page_count
 
     return 1
 
@@ -1140,10 +1195,10 @@ def _preview_image_for_selection(uploaded_file, selection):
         return Image.open(io.BytesIO(data)).convert("RGB")
 
     if extension == ".pdf" and fitz is not None:
-        doc = fitz.open(stream=data, filetype="pdf")
-        page = doc[(selection.get("page_number", 1) or 1) - 1]
-        pix = page.get_pixmap(matrix=fitz.Matrix(0.4, 0.4), alpha=False)
-        return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            page = doc[(selection.get("page_number", 1) or 1) - 1]
+            pix = page.get_pixmap(matrix=fitz.Matrix(0.4, 0.4), alpha=False)
+            return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
 
     if extension == ".pptx":
         prs = Presentation(io.BytesIO(data))
@@ -1342,13 +1397,27 @@ if uploaded_file:
     )
 
     if st.button("Extract Everything", type="primary", use_container_width=True):
+        progress_bar = st.progress(0, text="Starting...")
+        status_text = st.empty()
+
+        def on_progress(current, total):
+            if total > 1:
+                fraction = current / total
+                label = f"Processing page {current + 1} of {total}..." if current < total else "Finalizing..."
+                progress_bar.progress(fraction, text=label)
+                status_text.caption(label)
+
         with st.spinner("Reconstructing editable content..."):
             try:
                 uploaded_file.seek(0)
-                result, report, mode = process_uploaded_file(uploaded_file, selection)
+                result, report, mode = process_uploaded_file(uploaded_file, selection, on_progress)
             except Exception as exc:
+                progress_bar.empty()
+                status_text.empty()
                 st.exception(exc)
             else:
+                progress_bar.empty()
+                status_text.empty()
                 output_name = f"{Path(uploaded_file.name).stem}_editable.pptx"
                 st.success("Reconstruction complete.")
                 _render_summary_metrics(report, mode)
